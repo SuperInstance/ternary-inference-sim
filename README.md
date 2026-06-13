@@ -1,72 +1,102 @@
-# ternary-inference-sim
+# Ternary Inference Sim — Simulated Ternary Neural Network Inference on GPU
 
-Simulated ternary neural network inference — packed weights, Z₃ matmul, and conservation verification.
+**Ternary Inference Sim** simulates ternary neural network inference: weights are packed 16 per u32, matrix multiplication uses Z₃ arithmetic (conditional add/subtract/skip), and batch inference includes conservation verification. It provides the exact computational kernel that would run on ternary GPU hardware.
 
-## Why This Exists
+## Why It Matters
 
-Before deploying ternary weights to a real GPU, you need to verify the arithmetic is correct. This crate simulates the full ternary inference pipeline: pack weights 16-per-u32, run matrix-vector and matrix-matrix multiply using Z₃ addition, verify that ternary conservation laws hold (sum of outputs should be predictable from sum of inputs), and benchmark the theoretical throughput. It's a reference implementation and test oracle for GPU ternary kernels.
+Building ternary GPU kernels requires understanding the exact arithmetic at the bit level. This simulator provides that understanding without requiring actual ternary hardware. Every operation — packing, unpacking, Z₃ multiply, Z₃ add, matvec, matmul, activation — is implemented in pure Rust, serving as both executable specification and reference implementation. The conservation verification (checking that γ + η = C after each layer) ensures correctness: if a bug causes the conservation law to break, the simulator catches it immediately.
 
-## Architecture
+## How It Works
 
-### Core Types
+### Trit Packing
 
-- **`TritPack(u32)`** — 16 ternary values packed into one u32 register.
-- **`TernaryLayer`** — One neural network layer: packed weight matrix + dimensions.
-- **`TernaryNetwork`** — Multi-layer inference pipeline.
-- **`ConservationResult`** — Verifies input/output ternary sum conservation.
-- **`InferenceBenchmark`** — Tracks throughput (inferences/sec, effective TFLOPS).
+16 trits pack into a single u32, 2 bits per trit:
+- `-1` → `0b11`
+- `0` → `0b00`  
+- `+1` → `0b01`
 
-### Key Functions
+`TritPack::new(&[i8])` packs; `get(i)` extracts; `unpack()` returns all 16. O(16) = O(1) per pack.
 
-- `ternary_matvec`: Matrix-vector multiply in Z₃ arithmetic.
-- `ternary_matmul`: Matrix-matrix multiply.
-- `ternary_sign`: Sign activation function.
-- `verify_conservation`: Check that ternary mass is conserved across a layer.
+### Z₃ Arithmetic
 
-## Usage
-
-```rust
-use ternary_inference_sim::{TritPack, TernaryLayer, TernaryNetwork, verify_conservation};
-
-// Pack some weights
-let weights: Vec<TritPack> = vec![
-    TritPack::new(&[1, 0, -1, 1, 0, -1, 1, 0, -1, 1, 0, -1, 1, 0, -1, 1]),
-    TritPack::new(&[-1, 1, 0, -1, 1, 0, -1, 1, 0, -1, 1, 0, -1, 1, 0, -1]),
-];
-
-// Create a layer
-let layer = TernaryLayer::new("hidden_0", &weights, 16, 2);
-let input = TritPack::new(&[1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1]);
-let output = layer.forward(&input);
-
-// Verify conservation
-let conservation = verify_conservation(&input, &output);
-println!("Input sum: {}, Output sum: {}", conservation.input_sum, conservation.output_sum);
-
-// Multi-layer network
-let network = TernaryNetwork::new(vec![layer]);
-let batch_result = network.batch_inference(&[input]);
+**Ternary multiply** (tmul):
+```
+(-1)(-1) = +1, (-1)(+1) = -1, (+1)(-1) = -1, (+1)(+1) = +1
+anything × 0 = 0
 ```
 
-## API Reference
+**Ternary add** (tadd):
+```
+(-1)+(-1) = +1 (wraps), (-1)+0 = -1, (-1)+(+1) = 0
+0+0 = 0, 0+(+1) = +1
+(+1)+(+1) = -1 (wraps)
+```
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `TritPack::new(trits)` | `TritPack` | Pack 16 trits into u32 |
-| `pack.get(i)` | `i8` | Read one trit |
-| `ternary_matvec(w, v, rows)` | `Vec<i8>` | Matrix-vector multiply |
-| `ternary_matmul(a, b, r, c)` | `Vec<TritPack>` | Matrix-matrix multiply |
-| `TernaryLayer::forward(&self, input)` | `Vec<i8>` | Single inference |
-| `TernaryLayer::forward_batch(&self, inputs)` | `Vec<Vec<i8>>` | Batch inference |
-| `TernaryNetwork::inference(&self, input)` | `Vec<i8>` | Multi-layer forward pass |
-| `verify_conservation(input, output)` | `ConservationResult` | Conservation check |
+Both are O(1) table lookups.
 
-## The Deeper Idea
+### Matrix-Vector Product
 
-Ternary conservation is the analogue of **charge conservation in physics**. In a ternary system, the sum of all values (the "charge") should be traceable through every operation. If you put in a total charge of +5 and get out +12, something went wrong — either the arithmetic isn't in Z₃ or the packing is corrupt. Conservation verification is cheap (one sum per layer) and catches an entire class of packing and arithmetic bugs that unit tests with small values might miss.
+`ternary_matvec(weight, vector, rows)`: for each row, compute the dot product using Z₃ arithmetic:
 
-## Related Crates
+```
+output[r] = Z₃Σ weight[r][c] × vector[c]  for c in 0..16
+```
 
-- **ternary-pack** — bit-packing trits into u32 registers
-- **ternary-hotswap-inference** — live model swapping with ternary tensors
-- **ternary-cortex** — hierarchical ternary processing layers
+O(rows × 16) = O(16·R) per operation.
+
+### Matrix-Matrix Multiply
+
+`ternary_matmul(a, b, rows, cols)`: batch dot products. O(R × C × 16).
+
+### Ternary Sign Activation
+
+```
+sign(x) = +1 if x > 0, -1 if x < 0, 0 if x == 0
+```
+
+Standard sign function on the ternary domain.
+
+### Ternary Layer
+
+A `TernaryLayer` combines a weight matrix with sign activation: `output = sign(matvec(weights, input))`.
+
+## Quick Start
+
+```rust
+use ternary_inference_sim::{TritPack, ternary_matvec, ternary_sign};
+
+// Pack weights and input
+let weights = vec![TritPack::new(&[1, -1, 0, 1, 1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1])];
+let input = TritPack::new(&[1, 1, 0, -1, 1, 0, 1, -1, 0, 1, 1, -1, 0, 1, -1, 1]);
+
+// Matrix-vector product
+let output = ternary_matvec(&weights, &input, 1);
+let activated: Vec<i8> = output.iter().map(|&v| ternary_sign(v)).collect();
+```
+
+```bash
+cargo add ternary-inference-sim
+```
+
+## API
+
+| Type / Function | Description |
+|---|---|
+| `TritPack(u32)` | 16 packed trits: `new()`, `get(i)`, `unpack()` |
+| `ternary_matvec(w, v, rows)` | Weight × vector in Z₃ |
+| `ternary_matmul(a, b, r, c)` | Batch matrix multiply in Z₃ |
+| `ternary_sign(i8)` | Activation function |
+
+## Architecture Notes
+
+This is the reference implementation for all ternary computation in **SuperInstance**. Fleet GPU kernels implement these exact operations in CUDA/PTX. The γ + η = C conservation is verified per layer: non-zero outputs contribute γ, zero outputs contribute η. See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+
+## References
+
+- Li, Feng et al. "Ternary Weight Networks," *arXiv:1605.04711*, 2016.
+- Rastegari, Mohammad et al. "XNOR-Net," *ECCV*, 2016 — binary/ternary network inference.
+- Zhu, Chenzhuo et al. "Trained Ternary Quantization," *ICLR*, 2017.
+
+## License
+
+MIT
